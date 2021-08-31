@@ -17,6 +17,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from kfp.pipeline_spec import pipeline_spec_pb2 as pipeline_pb2
+from tfx.dsl.components.base import base_node
 from tfx.orchestration import data_types
 from tfx.orchestration import pipeline
 from tfx.orchestration.kubeflow.v2 import compiler_utils
@@ -68,7 +69,8 @@ class PipelineBuilder:
   def __init__(self,
                tfx_pipeline: pipeline.Pipeline,
                default_image: str,
-               default_commands: Optional[List[str]] = None):
+               default_commands: Optional[List[str]] = None,
+               exit_handler: Optional[base_node.BaseNode] = None):
     """Creates a PipelineBuilder object.
 
     A PipelineBuilder takes in a TFX pipeline object. Then
@@ -87,11 +89,14 @@ class PipelineBuilder:
           `ENTRYPOINT` and `CMD` defined in the Dockerfile. One can find more
           details regarding the difference between K8S and Docker conventions at
         https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#notes
+      exit_handler: the optional custom component for post actions triggered
+         after all pipeline tasks finish.
     """
     self._pipeline_info = tfx_pipeline.pipeline_info
     self._pipeline = tfx_pipeline
     self._default_image = default_image
     self._default_commands = default_commands
+    self._exit_handler = exit_handler
 
   def build(self) -> pipeline_pb2.PipelineSpec:
     """Build a pipeline PipelineSpec."""
@@ -102,7 +107,7 @@ class PipelineBuilder:
     pipeline_info = pipeline_pb2.PipelineInfo(
         name=self._pipeline_info.pipeline_name)
 
-    tasks = {}
+    tfx_tasks = {}
     component_defs = {}
     # Map from (producer component id, output key) to (new producer component
     # id, output key)
@@ -123,14 +128,39 @@ class PipelineBuilder:
             enable_cache=self._pipeline.enable_cache,
             pipeline_info=self._pipeline_info,
             channel_redirect_map=channel_redirect_map).build()
-        tasks.update(built_tasks)
+        tfx_tasks.update(built_tasks)
 
     result = pipeline_pb2.PipelineSpec(pipeline_info=pipeline_info)
+
+    # if exit handler is defined, put all the TFX tasks under tfx_dag,
+    # exit handler is a separate component triggered by tfx_dag.
+    if self._exit_handler:
+      result.components[compiler_utils.TFX_DAG_NAME].CopyFrom(
+          pipeline_pb2.ComponentSpec())
+      for name, task_spec in tfx_tasks.items():
+        result.components[compiler_utils.TFX_DAG_NAME].dag.tasks[name].CopyFrom(
+            task_spec)
+      # construct root with exit handler
+      exit_handler_task = step_builder.StepBuilder(
+          node=self._exit_handler,
+          deployment_config=deployment_config,
+          component_defs=component_defs,
+          image=self._default_image,
+          image_cmds=self._default_commands,
+          beam_pipeline_args=self._pipeline.beam_pipeline_args,
+          enable_cache=self._pipeline.enable_cache,
+          pipeline_info=self._pipeline_info,
+          channel_redirect_map=channel_redirect_map,
+          is_exit_handler=True).build()
+      result.root.CopyFrom(_build_root_with_exit_handler(
+          self._exit_handler, exit_handler_task[self._exit_handler.id]))
+    else:
+      for name, task_spec in tfx_tasks.items():
+        result.root.dag.tasks[name].CopyFrom(task_spec)
+
     result.deployment_spec.update(json_format.MessageToDict(deployment_config))
     for name, component_def in component_defs.items():
       result.components[name].CopyFrom(component_def)
-    for name, task_spec in tasks.items():
-      result.root.dag.tasks[name].CopyFrom(task_spec)
 
     # Attach runtime parameter to root's input parameter
     for param in pc.parameters:
@@ -138,3 +168,36 @@ class PipelineBuilder:
           compiler_utils.build_parameter_type_spec(param))
 
     return result
+
+
+def _build_root_with_exit_handler(
+    exit_handler: base_node.BaseNode,
+    exit_handler_task_spec: pipeline_pb2.PipelineTaskSpec
+) -> pipeline_pb2.ComponentSpec:
+  """Create the pipeline root with exit handler.
+
+  Args:
+    exit_handler: the optional custom component for post actions of TFX
+      pipeline, triggered after all pipeline tasks execution.
+    exit_handler_task_spec: the task spec of exit_handler.
+
+  Returns:
+    pipeline root componentSpec.
+  """
+  root_component_spec = pipeline_pb2.ComponentSpec()
+  tfx_components_ref = pipeline_pb2.ComponentRef()
+  tfx_components_ref.name = compiler_utils.TFX_DAG_NAME
+  tfx_components_task_info = pipeline_pb2.PipelineTaskInfo()
+  tfx_components_task_info.name = compiler_utils.TFX_DAG_NAME
+  root_component_spec.dag.tasks[
+      compiler_utils.TFX_DAG_NAME].component_ref.CopyFrom(tfx_components_ref)
+  root_component_spec.dag.tasks[compiler_utils.TFX_DAG_NAME].task_info.CopyFrom(
+      tfx_components_task_info)
+
+  root_component_spec.dag.tasks[exit_handler.id].CopyFrom(
+      exit_handler_task_spec)
+  task_info = pipeline_pb2.PipelineTaskInfo()
+  task_info.name = exit_handler.id
+  root_component_spec.dag.tasks[exit_handler.id].task_info.CopyFrom(task_info)
+
+  return root_component_spec

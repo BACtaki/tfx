@@ -130,7 +130,7 @@ class Pipeline:
     self.metadata_connection_config = metadata_connection_config
     self.execution_mode = execution_mode
 
-    self._beam_pipeline_args = beam_pipeline_args or []
+    self.beam_pipeline_args = beam_pipeline_args or []
 
     self.platform_config = platform_config
 
@@ -140,10 +140,9 @@ class Pipeline:
     # Calls property setter.
     self.components = components or []
 
-  @property
-  def beam_pipeline_args(self):
-    """Beam pipeline args used for all components in the pipeline."""
-    return self._beam_pipeline_args
+    if self.beam_pipeline_args:
+      for component in components:
+        add_beam_pipeline_args_to_component(component, beam_pipeline_args)
 
   @property
   def components(self):
@@ -187,7 +186,3 @@ class Pipeline:
     for layer in layers:
       for component in layer:
         self._components.append(component)
-
-    if self.beam_pipeline_args:
-      for component in self._components:
-        add_beam_pipeline_args_to_component(component, self.beam_pipeline_args)

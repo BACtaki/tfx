@@ -23,7 +23,6 @@ from tfx.dsl.compiler import constants
 from tfx.orchestration import metadata
 from tfx.orchestration.portable import execution_publish_utils
 from tfx.orchestration.portable.mlmd import context_lib
-from tfx.orchestration.portable.mlmd import event_lib
 from tfx.orchestration.portable.mlmd import execution_lib
 from tfx.proto.orchestration import pipeline_pb2
 
@@ -37,10 +36,9 @@ def mark_pipeline(
     pipeline: pipeline_pb2.Pipeline,
     from_nodes: Callable[[str], bool] = lambda _: True,
     to_nodes: Callable[[str], bool] = lambda _: True,
-    skip_nodes: Callable[[str], bool] = lambda _: False,
     snapshot_settings: pipeline_pb2
     .SnapshotSettings = _default_snapshot_settings,
-) -> pipeline_pb2.Pipeline:
+):
   """Modifies the Pipeline IR in place, in preparation for partial run.
 
   This function modifies the node-level execution_options to annotate them with
@@ -52,9 +50,6 @@ def mark_pipeline(
   -- i.e., the set of nodes that are reachable by traversing downstream from
   `from_nodes` AND also reachable by traversing upstream from `to_nodes`.
 
-  Any `reusable_nodes` will be reused in the partial run, as long as they do not
-  depend on a node that is marked to run.
-
   Args:
     pipeline: A valid compiled Pipeline IR proto to be marked.
     from_nodes: A predicate function that selects nodes by their ids. The set of
@@ -65,16 +60,8 @@ def mark_pipeline(
       nodes whose node_ids return True determine where the "sweep" ends (see
       detailed description).
       Defaults to lambda _: True (i.e., select all nodes).
-    skip_nodes: A predicate function that indicates which nodes between from and
-      to nodes can be skipped for pipeline run. Note that if a node depends on
-      nodes that can not be skipped, then it is still marked to run for pipeline
-      result correctness.
-      Defaults to lambda _: False.
     snapshot_settings: Settings needed to perform the snapshot step. Defaults to
       using LATEST_PIPELINE_RUN strategy.
-
-  Returns:
-    Updated pipeline IR.
 
   Raises:
     ValueError: If pipeline's execution_mode is not SYNC.
@@ -86,13 +73,9 @@ def mark_pipeline(
   _ensure_topologically_sorted(pipeline)
 
   node_map = _make_ordered_node_map(pipeline)
-
   from_node_ids = [node_id for node_id in node_map if from_nodes(node_id)]
   to_node_ids = [node_id for node_id in node_map if to_nodes(node_id)]
-  skip_node_ids = [node_id for node_id in node_map if skip_nodes(node_id)]
-  nodes_to_run = _compute_nodes_to_run(node_map, from_node_ids, to_node_ids,
-                                       skip_node_ids)
-
+  nodes_to_run = _compute_nodes_to_run(node_map, from_node_ids, to_node_ids)
   nodes_to_reuse = _compute_nodes_to_reuse(node_map, nodes_to_run)
   nodes_requiring_snapshot = _compute_nodes_requiring_snapshot(
       node_map, nodes_to_run, nodes_to_reuse)
@@ -100,10 +83,9 @@ def mark_pipeline(
   _mark_nodes(node_map, nodes_to_run, nodes_to_reuse, nodes_requiring_snapshot,
               snapshot_node)
   pipeline.runtime_spec.snapshot_settings.CopyFrom(snapshot_settings)
-  return pipeline
 
 
-def snapshot(mlmd_handle: metadata.Metadata,
+def snapshot(mlmd_connection_config: metadata.ConnectionConfigType,
              pipeline: pipeline_pb2.Pipeline) -> None:
   """Performs a snapshot.
 
@@ -112,7 +94,8 @@ def snapshot(mlmd_handle: metadata.Metadata,
   same pipeline run.
 
   Args:
-    mlmd_handle: A handle to the MLMD db.
+    mlmd_connection_config: Used for connecting to the MLMD where the snapshot
+      is to be performed.
     pipeline: The marked pipeline IR.
 
   Raises:
@@ -130,9 +113,10 @@ def snapshot(mlmd_handle: metadata.Metadata,
     logging.info('Using latest_pipeline_run_strategy.')
   else:
     raise ValueError('artifact_reuse_strategy not set in SnapshotSettings.')
-  logging.info('Preparing to reuse artifacts.')
-  _reuse_pipeline_run_artifacts(mlmd_handle, pipeline, base_run_id=base_run_id)
-  logging.info('Artifact reuse complete.')
+  with metadata.Metadata(connection_config=mlmd_connection_config) as m:
+    logging.info('Preparing to reuse artifacts.')
+    _reuse_pipeline_run_artifacts(m, pipeline, base_run_id=base_run_id)
+    logging.info('Artifact reuse complete.')
 
 
 def _pick_snapshot_node(node_map: Mapping[str, pipeline_pb2.PipelineNode],
@@ -279,17 +263,15 @@ def _traverse(node_map: Mapping[str, pipeline_pb2.PipelineNode],
 
 def _compute_nodes_to_run(
     node_map: 'collections.OrderedDict[str, pipeline_pb2.PipelineNode]',
-    from_node_ids: Collection[str], to_node_ids: Collection[str],
-    skip_node_ids: Collection[str]) -> Set[str]:
+    from_node_ids: Collection[str],
+    to_node_ids: Collection[str],
+) -> Set[str]:
+  # ) -> 'collections.OrderedDict[str, pipeline_pb2.PipelineNode]':
   """Returns the set of nodes between from_node_ids and to_node_ids."""
   ancestors_of_to_nodes = _traverse(node_map, _Direction.UPSTREAM, to_node_ids)
   descendents_of_from_nodes = _traverse(node_map, _Direction.DOWNSTREAM,
                                         from_node_ids)
-  nodes_considered_to_run = ancestors_of_to_nodes.intersection(
-      descendents_of_from_nodes)
-  nodes_to_run = _traverse(node_map, _Direction.DOWNSTREAM,
-                           nodes_considered_to_run - set(skip_node_ids))
-  return nodes_considered_to_run.intersection(nodes_to_run)
+  return ancestors_of_to_nodes.intersection(descendents_of_from_nodes)
 
 
 def _compute_nodes_to_reuse(
@@ -601,7 +583,7 @@ class _ArtifactRecycler:
     output_artifacts = execution_lib.get_artifacts_dict(
         self._mlmd,
         existing_execution.id,
-        event_types=list(event_lib.VALID_OUTPUT_EVENT_TYPES))
+        event_type=metadata_store_pb2.Event.OUTPUT)
 
     execution_publish_utils.publish_cached_execution(
         self._mlmd,
