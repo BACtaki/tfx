@@ -18,7 +18,9 @@
 *   Deprecated python3.6 support.
 
 ## Bug Fixes and Other Changes
+
 *   Depends on `google-cloud-aiplatform>=1.5.0,<2`.
+*   Fixed Vertex Pusher.
 
 ## Documentation Updates
 
