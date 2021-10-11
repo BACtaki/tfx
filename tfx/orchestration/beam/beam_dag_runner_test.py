@@ -13,315 +13,271 @@
 # limitations under the License.
 """Tests for tfx.orchestration.portable.beam_dag_runner."""
 import os
-from typing import Optional
+import tempfile
+from typing import Any, Dict, List, Optional
 
-from unittest import mock
+from absl.testing import parameterized
 import tensorflow as tf
-from tfx.dsl.compiler import constants
-from tfx.orchestration import metadata
+from tfx import types
+from tfx.dsl.compiler import compiler
+from tfx.dsl.components.base import base_component
+from tfx.dsl.components.base import base_executor
+from tfx.dsl.components.base import executor_spec as executor_spec_lib
+from tfx.orchestration import pipeline as pipeline_py
 from tfx.orchestration.beam import beam_dag_runner
 from tfx.orchestration.beam.legacy import beam_dag_runner as legacy_beam_dag_runner
 from tfx.orchestration.config import pipeline_config
+from tfx.orchestration.metadata import sqlite_metadata_connection_config
 from tfx.orchestration.portable import partial_run_utils
-from tfx.proto.orchestration import executable_spec_pb2
 from tfx.proto.orchestration import local_deployment_config_pb2
 from tfx.proto.orchestration import pipeline_pb2
-from tfx.proto.orchestration import platform_config_pb2
-from tfx.utils import test_case_utils
+from tfx.types.component_spec import ChannelParameter
+from tfx.types.component_spec import ExecutionParameter
 
 from google.protobuf import message
 from google.protobuf import text_format
 
-_PythonClassExecutableSpec = executable_spec_pb2.PythonClassExecutableSpec
-_ContainerExecutableSpec = executable_spec_pb2.ContainerExecutableSpec
-_DockerPlatformConfig = platform_config_pb2.DockerPlatformConfig
+_executed_components = []
+_COMPONENT_NAME = 'component_name'
 
 _LOCAL_DEPLOYMENT_CONFIG = text_format.Parse(
     """
-    executor_specs {
-      key: "my_example_gen"
-      value {
-        python_class_executable_spec {
-          class_path: "tfx.components.example_gen_executor"
-        }
-      }
-    }
-    executor_specs {
-      key: "my_transform"
-      value {
-        python_class_executable_spec {
-          class_path: "tfx.components.transform_executor"
-        }
-      }
-    }
-    executor_specs {
-      key: "my_trainer"
-      value {
-        container_executable_spec {
-          image: "path/to/docker/image"
-        }
-      }
-    }
-    custom_driver_specs {
-      key: "my_example_gen"
-      value {
-        python_class_executable_spec {
-          class_path: "tfx.components.example_gen_driver"
-        }
-      }
-    }
     metadata_connection_config {
-      fake_database {}
+        fake_database {}
     }
-    node_level_platform_configs {
-      key: "my_trainer"
-      value {
-        docker_platform_config {
-          docker_server_url: "docker/server/url"
-        }
-      }
-    }
-""", local_deployment_config_pb2.LocalDeploymentConfig())
+    """, local_deployment_config_pb2.LocalDeploymentConfig())
 
 _INTERMEDIATE_DEPLOYMENT_CONFIG = text_format.Parse(
     """
-    executor_specs {
-      key: "my_example_gen"
-      value {
-        [type.googleapis.com/tfx.orchestration.executable_spec.PythonClassExecutableSpec] {
-          class_path: "tfx.components.example_gen_executor"
-        }
-      }
-    }
-    executor_specs {
-      key: "my_transform"
-      value {
-        [type.googleapis.com/tfx.orchestration.executable_spec.PythonClassExecutableSpec] {
-          class_path: "tfx.components.transform_executor"
-        }
-      }
-    }
-    executor_specs {
-      key: "my_trainer"
-      value {
-        [type.googleapis.com/tfx.orchestration.executable_spec.ContainerExecutableSpec] {
-          image: "path/to/docker/image"
-        }
-      }
-    }
-    custom_driver_specs {
-      key: "my_example_gen"
-      value {
-        [type.googleapis.com/tfx.orchestration.executable_spec.PythonClassExecutableSpec] {
-          class_path: "tfx.components.example_gen_driver"
-        }
-      }
-    }
     metadata_connection_config {
       [type.googleapis.com/ml_metadata.ConnectionConfig] {
         fake_database {}
       }
     }
-    node_level_platform_configs {
-      key: "my_trainer"
-      value {
-        [type.googleapis.com/tfx.orchestration.platform_config.DockerPlatformConfig] {
-          docker_server_url: "docker/server/url"
-        }
-      }
-    }
-""", pipeline_pb2.IntermediateDeploymentConfig())
-
-_executed_components = []
-_component_executors = {}
-_component_drivers = {}
-_component_platform_configs = {}
-_component_to_pipeline_run = {}
+    """, pipeline_pb2.IntermediateDeploymentConfig())
 
 
-# TODO(b/162980675): When PythonExecutorOperator is implemented. We don't
-# Need to Fake the whole FakeComponentAsDoFn. Instead, just fake or mock
-# executors.
-class _FakeComponentAsDoFn(beam_dag_runner.PipelineNodeAsDoFn):
-
-  def __init__(self, pipeline_node: pipeline_pb2.PipelineNode,
-               mlmd_connection_config: metadata.ConnectionConfigType,
-               pipeline_info: pipeline_pb2.PipelineInfo,
-               pipeline_runtime_spec: pipeline_pb2.PipelineRuntimeSpec,
-               executor_spec: Optional[message.Message],
-               custom_driver_spec: Optional[message.Message],
-               deployment_config: Optional[message.Message],
-               pipeline: Optional[pipeline_pb2.Pipeline]):
-    super().__init__(pipeline_node, mlmd_connection_config, pipeline_info,
-                     pipeline_runtime_spec, executor_spec, custom_driver_spec,
-                     deployment_config, pipeline)
-    _component_executors[self._node_id] = executor_spec
-    _component_drivers[self._node_id] = custom_driver_spec
-    _component_platform_configs[self._node_id] = self._extract_platform_config(
-        self._deployment_config, self._node_id)
-    pipeline_run = None
-    for context in pipeline_node.contexts.contexts:
-      if context.type.name == constants.PIPELINE_RUN_CONTEXT_TYPE_NAME:
-        pipeline_run = context.name.field_value.string_value
-    _component_to_pipeline_run[self._node_id] = pipeline_run
-
-  def _run_node(self):
-    _executed_components.append(self._node_id)
+class _ArtifactTypeA(types.Artifact):
+  TYPE_NAME = 'ArtifactTypeA'
 
 
-class BeamDagRunnerTest(test_case_utils.TfxTest):
+class _ArtifactTypeB(types.Artifact):
+  TYPE_NAME = 'ArtifactTypeB'
+
+
+class _ArtifactTypeC(types.Artifact):
+  TYPE_NAME = 'ArtifactTypeC'
+
+
+class _ArtifactTypeD(types.Artifact):
+  TYPE_NAME = 'ArtifactTypeD'
+
+
+class _ArtifactTypeE(types.Artifact):
+  TYPE_NAME = 'ArtifactTypeE'
+
+
+# We define fake component spec classes below for testing.
+class _FakeComponentSpecA(types.ComponentSpec):
+  PARAMETERS = {_COMPONENT_NAME: ExecutionParameter(type=str)}
+  INPUTS = {}
+  OUTPUTS = {'output': ChannelParameter(type=_ArtifactTypeA)}
+
+
+class _FakeComponentSpecB(types.ComponentSpec):
+  PARAMETERS = {_COMPONENT_NAME: ExecutionParameter(type=str)}
+  INPUTS = {'a': ChannelParameter(type=_ArtifactTypeA)}
+  OUTPUTS = {'output': ChannelParameter(type=_ArtifactTypeB)}
+
+
+class _FakeComponentSpecC(types.ComponentSpec):
+  PARAMETERS = {_COMPONENT_NAME: ExecutionParameter(type=str)}
+  INPUTS = {'a': ChannelParameter(type=_ArtifactTypeA)}
+  OUTPUTS = {'output': ChannelParameter(type=_ArtifactTypeC)}
+
+
+class _FakeComponentSpecD(types.ComponentSpec):
+  PARAMETERS = {_COMPONENT_NAME: ExecutionParameter(type=str)}
+  INPUTS = {
+      'b': ChannelParameter(type=_ArtifactTypeB),
+      'c': ChannelParameter(type=_ArtifactTypeC),
+  }
+  OUTPUTS = {'output': ChannelParameter(type=_ArtifactTypeD)}
+
+
+class _FakeComponentSpecE(types.ComponentSpec):
+  PARAMETERS = {_COMPONENT_NAME: ExecutionParameter(type=str)}
+  INPUTS = {
+      'a': ChannelParameter(type=_ArtifactTypeA),
+      'b': ChannelParameter(type=_ArtifactTypeB),
+      'd': ChannelParameter(type=_ArtifactTypeD),
+  }
+  OUTPUTS = {'output': ChannelParameter(type=_ArtifactTypeE)}
+
+
+class _FakeExecutor(base_executor.BaseExecutor):
+
+  def Do(self, input_dict: Dict[str, List[types.Artifact]],
+         output_dict: Dict[str, List[types.Artifact]],
+         exec_properties: Dict[str, Any]):
+    _executed_components.append(exec_properties[_COMPONENT_NAME])
+
+
+def _get_fake_component(spec: types.ComponentSpec):
+  component_id = spec.__class__.__name__.replace('_FakeComponentSpec',
+                                                 '').lower()
+
+  class _FakeComponent(base_component.BaseComponent):
+    SPEC_CLASS = types.ComponentSpec
+    EXECUTOR_SPEC = executor_spec_lib.ExecutorClassSpec(_FakeExecutor)
+
+  return _FakeComponent(spec=spec).with_id(component_id)
+
+
+class BeamDagRunnerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    # Setup pipelines
-    self._pipeline = pipeline_pb2.Pipeline()
-    self.load_proto_from_text(
-        os.path.join(
-            os.path.dirname(__file__), 'testdata',
-            'pipeline_for_beam_dag_runner_test.pbtxt'), self._pipeline)
     _executed_components.clear()
-    _component_executors.clear()
-    _component_drivers.clear()
-    _component_platform_configs.clear()
-    _component_to_pipeline_run.clear()
 
-  @mock.patch.multiple(
-      beam_dag_runner.BeamDagRunner,
-      _PIPELINE_NODE_DO_FN_CLS=_FakeComponentAsDoFn,
-  )
-  def testRunWithLocalDeploymentConfig(self):
-    self._pipeline.deployment_config.Pack(_LOCAL_DEPLOYMENT_CONFIG)
-    beam_dag_runner.BeamDagRunner().run(self._pipeline)
-    self.assertEqual(
-        _component_executors, {
-            'my_example_gen':
-                text_format.Parse(
-                    'class_path: "tfx.components.example_gen_executor"',
-                    _PythonClassExecutableSpec()),
-            'my_transform':
-                text_format.Parse(
-                    'class_path: "tfx.components.transform_executor"',
-                    _PythonClassExecutableSpec()),
-            'my_trainer':
-                text_format.Parse('image: "path/to/docker/image"',
-                                  _ContainerExecutableSpec()),
-            'my_importer':
-                None,
-        })
-    self.assertEqual(
-        _component_drivers, {
-            'my_example_gen':
-                text_format.Parse(
-                    'class_path: "tfx.components.example_gen_driver"',
-                    _PythonClassExecutableSpec()),
-            'my_transform':
-                None,
-            'my_trainer':
-                None,
-            'my_importer':
-                None,
-        })
-    self.assertEqual(
-        _component_platform_configs, {
-            'my_example_gen':
-                None,
-            'my_transform':
-                None,
-            'my_trainer':
-                text_format.Parse('docker_server_url: "docker/server/url"',
-                                  _DockerPlatformConfig()),
-            'my_importer':
-                None,
-        })
-    # 'my_importer' has no upstream and can be executed in any order.
-    self.assertIn('my_importer', _executed_components)
-    _executed_components.remove('my_importer')
-    self.assertEqual(_executed_components,
-                     ['my_example_gen', 'my_transform', 'my_trainer'])
-    # Verifies that every component gets a not-None pipeline_run.
-    self.assertTrue(all(_component_to_pipeline_run.values()))
+  def _getTestPipeline(  # pylint: disable=invalid-name
+      self, platform_config: message.Message) -> pipeline_py.Pipeline:
+    component_a = _get_fake_component(
+        _FakeComponentSpecA(
+            output=types.Channel(type=_ArtifactTypeA),
+            component_name='_FakeComponent.a'))
+    component_b = _get_fake_component(
+        _FakeComponentSpecB(
+            a=component_a.outputs['output'],
+            output=types.Channel(type=_ArtifactTypeB),
+            component_name='_FakeComponent.b'))
+    component_c = _get_fake_component(
+        _FakeComponentSpecC(
+            a=component_a.outputs['output'],
+            output=types.Channel(type=_ArtifactTypeC),
+            component_name='_FakeComponent.c'))
+    component_c.add_upstream_node(component_b)
+    component_d = _get_fake_component(
+        _FakeComponentSpecD(
+            b=component_b.outputs['output'],
+            c=component_c.outputs['output'],
+            output=types.Channel(type=_ArtifactTypeD),
+            component_name='_FakeComponent.d'))
+    component_e = _get_fake_component(
+        _FakeComponentSpecE(
+            a=component_a.outputs['output'],
+            b=component_b.outputs['output'],
+            d=component_d.outputs['output'],
+            output=types.Channel(type=_ArtifactTypeE),
+            component_name='_FakeComponent.e'))
 
-  @mock.patch.multiple(
-      beam_dag_runner.BeamDagRunner,
-      _PIPELINE_NODE_DO_FN_CLS=_FakeComponentAsDoFn,
-  )
-  def testRunWithIntermediateDeploymentConfig(self):
-    self._pipeline.deployment_config.Pack(_INTERMEDIATE_DEPLOYMENT_CONFIG)
-    beam_dag_runner.BeamDagRunner().run(self._pipeline)
-    self.assertEqual(
-        _component_executors, {
-            'my_example_gen':
-                text_format.Parse(
-                    'class_path: "tfx.components.example_gen_executor"',
-                    _PythonClassExecutableSpec()),
-            'my_transform':
-                text_format.Parse(
-                    'class_path: "tfx.components.transform_executor"',
-                    _PythonClassExecutableSpec()),
-            'my_trainer':
-                text_format.Parse('image: "path/to/docker/image"',
-                                  _ContainerExecutableSpec()),
-            'my_importer':
-                None,
-        })
-    self.assertEqual(
-        _component_drivers, {
-            'my_example_gen':
-                text_format.Parse(
-                    'class_path: "tfx.components.example_gen_driver"',
-                    _PythonClassExecutableSpec()),
-            'my_transform':
-                None,
-            'my_trainer':
-                None,
-            'my_importer':
-                None,
-        })
-    self.assertEqual(
-        _component_platform_configs, {
-            'my_example_gen':
-                None,
-            'my_transform':
-                None,
-            'my_trainer':
-                text_format.Parse('docker_server_url: "docker/server/url"',
-                                  _DockerPlatformConfig()),
-            'my_importer':
-                None,
-        })
-    # 'my_importer' has no upstream and can be executed in any order.
-    self.assertIn('my_importer', _executed_components)
-    _executed_components.remove('my_importer')
-    self.assertEqual(_executed_components,
-                     ['my_example_gen', 'my_transform', 'my_trainer'])
-    # Verifies that every component gets a not-None pipeline_run.
-    self.assertTrue(all(_component_to_pipeline_run.values()))
+    temp_path = tempfile.mkdtemp()
+    pipeline_root_path = os.path.join(temp_path, 'pipeline_root')
+    metadata_path = os.path.join(temp_path, 'metadata.db')
+    test_pipeline = pipeline_py.Pipeline(
+        pipeline_name='test_pipeline',
+        pipeline_root=pipeline_root_path,
+        metadata_connection_config=sqlite_metadata_connection_config(
+            metadata_path),
+        components=[
+            component_d, component_c, component_a, component_b, component_e
+        ],
+        platform_config=platform_config)
+    return test_pipeline
 
-  @mock.patch.multiple(
-      beam_dag_runner.BeamDagRunner,
-      _PIPELINE_NODE_DO_FN_CLS=_FakeComponentAsDoFn,
-  )
-  def testPartialRunWithLocalDeploymentConfig(self):
-    self._pipeline.deployment_config.Pack(_LOCAL_DEPLOYMENT_CONFIG)
-    partial_run_utils.mark_pipeline(
-        self._pipeline,
-        from_nodes=(lambda node_id: 'trainer' in node_id),
-        to_nodes=(lambda node_id: 'trainer' in node_id))
-    beam_dag_runner.BeamDagRunner().run(self._pipeline)
-    self.assertEqual(_executed_components, ['my_trainer'])
+  def _getTestPipelineIR(  # pylint: disable=invalid-name
+      self, platform_config: message.Message) -> pipeline_pb2.Pipeline:
+    test_pipeline = self._getTestPipeline(platform_config)
+    c = compiler.Compiler()
+    return c.compile(test_pipeline)
 
-  @mock.patch.multiple(
-      beam_dag_runner.BeamDagRunner,
-      _PIPELINE_NODE_DO_FN_CLS=_FakeComponentAsDoFn,
-  )
-  def testPartialRunWithIntermediateDeploymentConfig(self):
-    self._pipeline.deployment_config.Pack(_INTERMEDIATE_DEPLOYMENT_CONFIG)
-    partial_run_utils.mark_pipeline(
-        self._pipeline,
-        from_nodes=(lambda node_id: 'trainer' in node_id),
-        to_nodes=(lambda node_id: 'trainer' in node_id))
-    beam_dag_runner.BeamDagRunner().run(self._pipeline)
-    self.assertEqual(_executed_components, ['my_trainer'])
+  @parameterized.named_parameters([{
+      'testcase_name': 'LocalDeploymentConfig',
+      'platform_config': _LOCAL_DEPLOYMENT_CONFIG,
+  }, {
+      'testcase_name': 'IntermediateDeploymentConfig',
+      'platform_config': _INTERMEDIATE_DEPLOYMENT_CONFIG,
+  }])
+  def testRun(self, platform_config: message.Message):
+    test_pipeline = self._getTestPipeline(platform_config)
+    beam_dag_runner.BeamDagRunner().run(test_pipeline)
+    self.assertEqual(_executed_components, [
+        '_FakeComponent.a', '_FakeComponent.b', '_FakeComponent.c',
+        '_FakeComponent.d', '_FakeComponent.e'
+    ])
+
+  @parameterized.named_parameters([{
+      'testcase_name':
+          'LocalDeploymentConfig',
+      'platform_config':
+          text_format.Parse(
+              """
+              metadata_connection_config {
+                  fake_database {}
+              }
+              """, local_deployment_config_pb2.LocalDeploymentConfig()),
+      'partial_run_nodes':
+          None,
+      'expected_executed_components': [
+          '_FakeComponent.a', '_FakeComponent.b', '_FakeComponent.c',
+          '_FakeComponent.d', '_FakeComponent.e'
+      ],
+  }, {
+      'testcase_name':
+          'IntermediateDeploymentConfig',
+      'platform_config':
+          text_format.Parse(
+              """
+              metadata_connection_config {
+                [type.googleapis.com/ml_metadata.ConnectionConfig] {
+                  fake_database {}
+                }
+              }
+              """, pipeline_pb2.IntermediateDeploymentConfig()),
+      'partial_run_nodes':
+          None,
+      'expected_executed_components': [
+          '_FakeComponent.a', '_FakeComponent.b', '_FakeComponent.c',
+          '_FakeComponent.d', '_FakeComponent.e'
+      ],
+  }, {
+      'testcase_name':
+          'Partial_LocalDeploymentConfig',
+      'platform_config':
+          text_format.Parse(
+              """
+              metadata_connection_config {
+                  fake_database {}
+              }
+              """, local_deployment_config_pb2.LocalDeploymentConfig()),
+      'partial_run_nodes': ['a'],
+      'expected_executed_components': ['_FakeComponent.a'],
+  }, {
+      'testcase_name':
+          'Partial_IntermediateDeploymentConfig',
+      'platform_config':
+          text_format.Parse(
+              """
+              metadata_connection_config {
+                [type.googleapis.com/ml_metadata.ConnectionConfig] {
+                  fake_database {}
+                }
+              }
+              """, pipeline_pb2.IntermediateDeploymentConfig()),
+      'partial_run_nodes': ['a'],
+      'expected_executed_components': ['_FakeComponent.a'],
+  }])
+  def testRunWithIR(self, platform_config: message.Message,
+                    partial_run_nodes: Optional[List[str]],
+                    expected_executed_components: List[str]):
+    test_pipeline = self._getTestPipelineIR(platform_config)
+    if partial_run_nodes is not None:
+      partial_run_utils.mark_pipeline(
+          test_pipeline,
+          from_nodes=lambda node_id: node_id in partial_run_nodes,
+          to_nodes=lambda node_id: node_id in partial_run_nodes)
+    beam_dag_runner.BeamDagRunner().run_with_ir(test_pipeline)
+    self.assertEqual(_executed_components, expected_executed_components)
 
   def testLegacyBeamDagRunnerConstruction(self):
     self.assertIsInstance(beam_dag_runner.BeamDagRunner(),

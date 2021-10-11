@@ -26,12 +26,24 @@ from tfx.experimental.templates import test_utils
 
 @unittest.skipIf(tf.__version__ < '2',
                  'Uses keras Model only compatible with TF 2.x')
-class PenguinTemplateLocalEndToEndTest(test_utils.BaseLocalEndToEndTest):
+class PenguinTemplateLocalEndToEndTest(test_utils.BaseEndToEndTest):
   """This test runs all components in the template."""
 
   def setUp(self):
     super().setUp()
     self._pipeline_name = 'PENGUIN_TEMPLATE_E2E_TEST'
+
+  def _getAllUnitTests(self):
+    for root, _, files in os.walk(self._project_dir):
+      base_dir = os.path.relpath(root, self._project_dir)
+      if base_dir == '.':  # project_dir == root
+        base_module = ''
+      else:
+        base_module = base_dir.replace(os.path.sep, '.') + '.'
+
+      for filename in files:
+        if filename.endswith('_test.py'):
+          yield base_module + filename[:-3]
 
   def testGeneratedUnitTests(self):
     self._copyTemplate('penguin')
@@ -44,33 +56,59 @@ class PenguinTemplateLocalEndToEndTest(test_utils.BaseLocalEndToEndTest):
     self._copyTemplate('penguin')
     os.environ['LOCAL_HOME'] = os.path.join(self._temp_dir, 'local')
 
-    # Create a pipeline with only one component.
-    self._create_pipeline()
-    self._run_pipeline()
+    # Create a pipeline with only initial components.
+    result = self._runCli([
+        'pipeline',
+        'create',
+        '--engine',
+        'local',
+        '--pipeline_path',
+        'local_runner.py',
+    ])
+    self.assertIn(
+        'Pipeline "{}" created successfully.'.format(self._pipeline_name),
+        result)
 
-    self._copy_schema()
+    # Run the pipeline.
+    self._runCli([
+        'run',
+        'create',
+        '--engine',
+        'local',
+        '--pipeline_name',
+        self._pipeline_name,
+    ])
 
     # Update the pipeline to include all components.
     updated_pipeline_file = self._addAllComponents()
     logging.info('Updated %s to add all components to the pipeline.',
                  updated_pipeline_file)
-
-    # Update the pipeline to use ImportSchemaGen
-    self._uncomment('local_runner.py', ['schema_path=generated_schema_path'])
-    self._replaceFileContent(
-        'local_runner.py',
-        [('schema_path=generated_schema_path', 'schema_path=\'schema.pbtxt\'')])
-
     # Lowers required threshold to make tests stable.
     self._replaceFileContent(
         os.path.join('pipeline', 'configs.py'), [
             ('EVAL_ACCURACY_THRESHOLD = 0.6', 'EVAL_ACCURACY_THRESHOLD = 0.1'),
         ])
+    result = self._runCli([
+        'pipeline',
+        'update',
+        '--engine',
+        'local',
+        '--pipeline_path',
+        'local_runner.py',
+    ])
+    self.assertIn(
+        'Pipeline "{}" updated successfully.'.format(self._pipeline_name),
+        result)
 
-    logging.info(
-        'Updated pipeline to add all components and use user provided schema.')
-    self._update_pipeline()
-    self._run_pipeline()
+    # Run the updated pipeline.
+    self._runCli([
+        'run',
+        'create',
+        '--engine',
+        'local',
+        '--pipeline_name',
+        self._pipeline_name,
+    ])
 
 
 if __name__ == '__main__':
